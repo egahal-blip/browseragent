@@ -1,158 +1,348 @@
 #!/usr/bin/env python3
 """
-Browser Agent — простой CLI для выполнения задач через браузер с Polza.ai LLM.
+Browser Agent — AI агент для автоматизации браузера.
+
+КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА БЕЗОПАСНОСТИ:
+- НИКОГДА не оплачивать без подтверждения пользователя
+- ВСЕГДА проверять модальные окна
+- ОСТАНАВЛИВАТЬСЯ перед финальным действием
 
 Использование:
     python main.py "зайди на яндекс еду и закажи пиццу"
-    python main.py "найди статью про python на wikipedia"
 """
 
 import asyncio
 import os
 import sys
 import io
+import re
 from pathlib import Path
 
 # Устанавливаем UTF-8 кодировку для консоли Windows
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+	sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+	sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 from dotenv import load_dotenv
 
-from browser_use.agent.service import Agent
-from browser_use.browser.session import BrowserSession
-from browser_use.browser.profile import BrowserProfile
-from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use import Agent, BrowserSession, BrowserProfile, ChatOpenAI
+from browser_use.agent.prompts import AgentMessagePrompt
+from browser_use.browser.views import BrowserStateSummary
+from browser_use.agent.views import AgentOutput
+
+from security_layer import SecurityLayer, SecurityLayerBlockedAction
+from modal_enhancer import ModalEnhancer
 
 load_dotenv()
 
 
 def get_polza_llm(model: str = "openai/gpt-4o", temperature: float = 0.0):
-    """
-    Создаёт LLM клиент для Polza.ai (OpenAI-совместимый API).
+	"""Создаёт LLM клиент для Polza.ai (OpenAI-совместимый API)."""
+	api_key = os.getenv("POLZA_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-    Args:
-        model: Название модели (например: openai/gpt-4o, deepcogito/cogito-v2.1-671b)
-        temperature: Температура для генерации
-    """
-    api_key = os.getenv("POLZA_API_KEY") or os.getenv("OPENAI_API_KEY")
+	if not api_key:
+		print("Ошибка: POLZA_API_KEY или OPENAI_API_KEY не найден в .env")
+		print("Создай файл .env с ключом:")
+		print("POLZA_API_KEY=твой_ключ")
+		sys.exit(1)
 
-    if not api_key:
-        print("Ошибка: POLZA_API_KEY или OPENAI_API_KEY не найден в .env")
-        print("Создай файл .env с ключом:")
-        print("POLZA_API_KEY=твой_ключ")
-        sys.exit(1)
+	return ChatOpenAI(
+		model=model,
+		api_key=api_key,
+		base_url="https://api.polza.ai/v1",
+		temperature=temperature,
+	)
 
-    return ChatOpenAI(
-        model=model,
-        api_key=api_key,
-        base_url="https://api.polza.ai/v1",  # Polza.ai API endpoint
-        temperature=temperature,
-    )
 
+# =============================================================================
+# ПАТЧ ДЛЯ УВЕЛИЧЕНИЯ ЛИМИТА ИНФОРМАЦИИ О СТРАНИЦЕ
+# =============================================================================
+
+_original_agent_message_prompt_init = AgentMessagePrompt.__init__
+
+def _patched_agent_message_prompt_init(self, *args, **kwargs):
+	"""Патченый __init__ с увеличенным лимитом информации о странице."""
+	if 'max_clickable_elements_length' not in kwargs:
+		kwargs['max_clickable_elements_length'] = 150000  # 150K вместо 40K
+	_original_agent_message_prompt_init(self, *args, **kwargs)
+
+AgentMessagePrompt.__init__ = _patched_agent_message_prompt_init
+
+
+# =============================================================================
+# СИСТЕМНЫЙ ПРОМПТ С БЕЗОПАСНОСТЬЮ
+# =============================================================================
+
+SECURITY_PROMPT = """
+
+<ОГРАНИЧЕНИЯ_БЕЗОПАСНОСТИ>
+
+ЗОЛОТОЕ ПРАВИЛО: Выполняй ТОЛЬКО то, о чём попросил пользователь — не больше, не меньше.
+
+ПРИМЕРЫ КОРРЕКТНОГО ПОВЕДЕНИЯ:
+- "Добавь пиццу в корзину" → нашёл, выбрал опции, добавил в корзину → done (СТОП, не оформляй заказ)
+- "Оформи заказ" → добавил в корзину, перешёл к checkout, заполнил данные → СТОП перед финальной оплатой
+- "Найди товар" → нашёл товар, открыл страницу → done (НЕ добавляй в корзину если не просили)
+
+ПРИМЕРЫ НЕПРАВИЛЬНОГО ПОВЕДЕНИЯ (НЕ ДЕЛАЙ ТАК):
+- "Добавь в корзину" → добавил → оформил заказ ❌
+- "Найди товар" → нашёл → добавил в корзину → оформил заказ ❌
+- "Оформи заказ" → дошёл до checkout → нажал "Pay now" ❌
+
+ФИНАЛЬНАЯ ЧЕРТА — ГДЕ ОСТАНАВЛИВАТЬСЯ:
+✅ МОЖНО: добавлять в корзину, выбирать опции, переходить к checkout, заполнять адрес/телефон
+❌ ЗАПРЕЩЕНО:
+   - Нажимать финальные кнопки оплаты ("Pay now", "Confirm payment", "Place order and pay")
+   - Открывать новые вкладки или окна — работай ТОЛЬКО в одной вкладке
+   - Кликать ссылки которые открывают новую вкладку (target="_blank", "open in new tab")
+
+Если видишь поля для ввода банковской карты — СТОП и вызови done, описав что готово к оплате.
+Если ссылка открывает новую вкладку — НЕ кликай на неё, найди другой способ.
+
+МОДАЛЬНЫЕ ОКНА — КРИТИЧЕСКИ ВАЖНО ПРОВЕРЯТЬ ПЕРВЫМ ДЕЛОМ!
+
+ПЕРВЫЙ ШАГ перед ЛЮБЫМ действием:
+1. Посмотри на скриншот — есть ли модальное окно?
+2. Посмотри на DOM элементы — ищи role="dialog", aria-modal="true", class="modal"
+3. Если видишь elements с индексами [i], [j] — проверь их атрибуты role и aria-modal
+
+Признаки модального окна (ВИЗУАЛЬНЫЕ):
+- Затемнённый фон вокруг (overlay, backdrop)
+- Всплывающая форма/карточка по центру экрана или снизу
+- Кнопки закрытия (X, крестик, "Отмена", "Закрыть", "Cancel")
+- Модальное окно ПЕРЕКРЫВАЕТ остальную страницу
+- Часто имеет высокий z-index
+
+Признаки модального окна (DOM):
+- role="dialog" или role="alertdialog"
+- aria-modal="true"
+- class содержит: modal, dialog, popup, overlay, lightbox, drawer
+- position: fixed или absolute с высоким z-index
+
+КАК РАБОТАТЬ С МОДАЛЬНЫМ ОКНОМ:
+1. Если модальное окно открылось → работай ТОЛЬКО с элементами внутри него
+2. Игнорируй элементы под модальным окном — они недоступны пока модальное окно открыто
+3. Если нужно выбрать опцию (размер, соус, добавка, цвет) и пользователь НЕ указал какую:
+   → Выбери ЛЮБУЮ доступную опцию
+   → Приоритет: первая помеченная как "recommended" / "popular" / "selected" / "default"
+   → Если таких меток нет — выбери ПЕРВУЮ доступную
+   → Это нормально — пользователь может уточнить потом
+4. После КАЖДОГО клика/действия в модальном окне:
+   → ВСЕГДА добавляй действие 'wait' с временем 1-2 секунды
+   → Это нужно чтобы модальное окно обновилось/закрылось
+5. После закрытия модального окна → проверь что появилось дальше (новое модальное, обновление страницы и т.д.)
+
+КАК ВЫБИРАТЬ КНОПКИ В МОДАЛЬНОМ ОКНЕ:
+- Сначала ищи основные кнопки действия: "Добавить", "В корзину", "Выбрать", "Apply", "Save", "OK"
+- Затем кнопки выбора опций: radio buttons, checkbox, карточки с вариантами
+- В последнюю очередь кнопки закрытия: "Отмена", "Закрыть", X (крестик), "Cancel"
+- Если кнопка имеет атрибут disabled или aria-disabled="true" — НЕ кликай на неё
+
+ВАЖНО: Элементы модального окна имеют БОЛЬШИЙ приоритет чем элементы страницы под ним!
+
+ЯЗЫК:
+- Отвечай на русском языке
+- В done пиши результат на русском
+
+</ОГРАНИЧЕНИЯ_БЕЗОПАСНОСТИ>
+"""
+
+
+# =============================================================================
+# SUB-AGENT COORDINATOR
+# =============================================================================
+
+class SubAgentCoordinator:
+	"""Координатор с интегрированным Security Layer и Modal Enhancer."""
+
+	def __init__(self, browser_session: BrowserSession, llm: ChatOpenAI):
+		self.browser_session = browser_session
+		self.llm = llm
+		self.security_layer = SecurityLayer()
+		self.modal_enhancer = ModalEnhancer(debug=True)
+
+	async def _combined_step_callback(
+		self,
+		browser_state: 'BrowserStateSummary',
+		agent_output: 'AgentOutput',
+		step: int
+	) -> None:
+		"""Комбинированный callback, который вызывает и security_layer, и modal_enhancer."""
+		# Сначала вызываем modal_enhancer для детекции модальных окон
+		await self.modal_enhancer(browser_state, agent_output, step)
+
+		# Затем вызываем security_layer для проверки безопасности
+		# (он может вызвать исключение для блокировки опасных действий)
+		await self.security_layer(browser_state, agent_output, step)
+
+	async def run_with_sub_agent(self, task: str) -> str:
+		"""Запускает выполнение задачи с Security Layer и Modal Enhancer."""
+		print("\n🤖 Запуск агента с Security Layer и Modal Enhancer")
+
+		agent = Agent(
+			task=task,
+			llm=self.llm,
+			browser_session=self.browser_session,
+			extend_system_message=SECURITY_PROMPT,
+			include_attributes=[
+				# Базовые атрибуты
+				'aria-label', 'title', 'placeholder', 'name', 'type',
+				'value', 'href', 'id', 'class',
+				# Для тестирования
+				'data-testid', 'data-qa', 'data-cy',
+				# Для модальных окон и опций
+				'role', 'aria-modal', 'aria-selected', 'aria-checked',
+				'checked', 'selected', 'disabled', 'readonly',
+				# Для текстового контента
+				'text-content', 'alt', 'label',
+				# Дополнительные атрибуты для модальных окон
+				'style', 'tabindex', 'data-dismiss', 'data-toggle',
+			],
+			# ИНТЕГРИРУЕМ КОМБИНИРОВАННЫЙ CALLBACK
+			register_new_step_callback=self._combined_step_callback,
+		)
+
+		history = await agent.run()
+
+		# Выводим статистику Security Layer и Modal Enhancer
+		stats = self.security_layer.get_stats()
+		modal_stats = self.modal_enhancer.get_stats()
+		print("\n" + "=" * 50)
+		print(f"📊 Статистика работы:")
+		print(f"  Всего шагов: {stats['steps']}")
+		print(f"  Security Layer:")
+		print(f"    Разрешено: {stats['allowed']}")
+		print(f"    Заблокировано: {stats['blocked']}")
+		print(f"  Modal Enhancer:")
+		print(f"    Модальных окон обнаружено: {modal_stats['modals_detected']}")
+		print("=" * 50)
+
+		if history and len(history) > 0:
+			result = history[-1].result
+			if isinstance(result, dict) and 'text' in result:
+				return result['text']
+			elif hasattr(result, 'text'):
+				return result.text
+			elif isinstance(result, str):
+				return result
+
+		return 'Задача выполнена'
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
 
 async def run_task(task: str, model: str = "openai/gpt-4o", headless: bool = False):
-    """
-    Выполняет задачу в браузере.
+	"""Выполняет задачу с Security Layer и Modal Enhancer."""
+	print(f"Запускаю агента с задачей: {task}")
+	print(f"Модель: {model}")
+	print(f"Режим браузера: {'видимый'}")
+	print("-" * 50)
+	print("🔐 Security Layer: активен")
+	print("   ✓ Checkout разрешён (до финальной оплаты)")
+	print("   ✗ Финальная оплата ЗАПРЕЩЕНА")
+	print("   ✗ Новые вкладки ЗАПРЕЩЕНЫ")
+	print("👁️  Modal Enhancer: активен")
+	print("   ✓ Детекция модальных окон (role, aria-modal)")
+	print("   ✓ Приоритетизация элементов модального окна")
+	print("   ✓ Подсказки для действий в модальном окне")
+	print("-" * 50)
 
-    Args:
-        task: Описание задачи на русском или английском
-        model: Название модели для Polza.ai
-        headless: Запускать браузер в фоновом режиме (без UI)
-    """
-    print(f"Запускаю агента с задачей: {task}")
-    print(f"Модель: {model}")
-    print(f"Режим браузера: {'фоновой' if headless else 'видимый'}")
-    print("-" * 50)
+	llm = get_polza_llm(model=model)
 
-    # Создаём LLM клиент
-    llm = get_polza_llm(model=model)
+	browser_profile = BrowserProfile(
+		headless=headless,
+		user_data_dir=str(Path.home() / ".browser-agent" / "profile"),
+		keep_alive=True,  # Браузер остаётся открытым после завершения агента
+	)
 
-    # Создаём браузерную сессию
-    browser_profile = BrowserProfile(
-        headless=headless,
-        # Можно добавить user_data_dir для сохранения сессий
-        # user_data_dir=str(Path.home() / ".browser-agent" / "profile"),
-    )
+	browser_session = BrowserSession(browser_profile=browser_profile)
+	coordinator = SubAgentCoordinator(browser_session, llm)
 
-    browser_session = BrowserSession(browser_profile=browser_profile)
+	try:
+		result = await coordinator.run_with_sub_agent(task)
+		print("-" * 50)
+		print("✅ Задача выполнена!")
+		print(f"Результат: {result}")
 
-    try:
-        # Создаём и запускаем агента
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser_session=browser_session,
-        )
+	except KeyboardInterrupt:
+		print("\n❌ Прервано пользователем")
+	except SecurityLayerBlockedAction as e:
+		print(f"\n🔒 {e}")
+		print("Агент остановился из-за попытки опасного действия.")
+	except Exception as e:
+		print(f"\n⚠️  Ошибка: {e}")
+		raise
+	finally:
+		# Браузер остаётся открытым благодаря keep_alive=True
+		print("\n" + "=" * 60)
+		print("🔵 БРАУЗЕР ОСТАЁТСЯ ОТКРЫТЫМ")
+		print("=" * 60)
+		print("Вы можете:")
+		print("  - Продолжить работу в браузере вручную")
+		print("  - Нажать Ctrl+C чтобы закрыть браузер и выйти")
+		print("=" * 60)
 
-        await agent.run()
-
-        print("-" * 50)
-        print("Задача выполнена!")
-
-    except KeyboardInterrupt:
-        print("\nПрервано пользователем")
-    except Exception as e:
-        print(f"\nОшибка: {e}")
-        raise
-    finally:
-        # Закрываем браузер
-        await browser_session.stop()
+		try:
+			await asyncio.Event().wait()
+		except KeyboardInterrupt:
+			print("\n🛑 Закрытие браузера по запросу пользователя...")
+			await browser_session.stop()
+			print("✅ Браузер закрыт")
 
 
 def main():
-    """Точка входа для CLI."""
-    if len(sys.argv) < 2:
-        print("Browser Agent — AI агент для браузера")
-        print("")
-        print("Использование:")
-        print("  python main.py \"твоя задача\"")
-        print("")
-        print("Примеры:")
-        print("  python main.py \"зайди на яндекс еду и закажи пиццу пепперони\"")
-        print("  python main.py \"найди статью про Python на Википедии\"")
-        print("  python main.py \"открой GitHub и найди репозиторий browser-use\"")
-        print("")
-        print("Переменные окружения (.env):")
-        print("  POLZA_API_KEY=твой_ключ")
-        print("  OPENAI_API_KEY=твой_ключ  # альтернатива")
-        print("")
-        print("Опции:")
-        print("  --model MODEL    Модель LLM (default: openai/gpt-4o)")
-        print("  --headless       Фоновый режим браузера")
-        sys.exit(1)
+	"""Точка входа для CLI."""
+	if len(sys.argv) < 2:
+		print("Browser Agent — AI агент для браузера С БЕЗОПАСНОСТЬЮ")
+		print("")
+		print("🔐 Security Layer:")
+		print("  - Разрешает: добавление в корзину, checkout, заполнение данных")
+		print("  - Блокирует: финальную оплату (Pay Now, Confirm Payment)")
+		print("  - Блокирует: открытие новых вкладок")
+		print("  - Распознаёт модальные окна")
+		print("")
+		print("Использование:")
+		print("  python main.py \"твоя задача\"")
+		print("")
+		print("Примеры:")
+		print("  python main.py \"оформи пиццу на яндекс еде\"")
+		print("  python main.py \"добавь товар в корзину\"")
+		print("")
+		print("⚠️  Агент остановится перед финальной оплатой!")
+		print("⚠️  Агент работает только в одной вкладке!")
+		print("")
+		print("Опции:")
+		print("  --model MODEL    Модель LLM (default: openai/gpt-4o)")
+		sys.exit(1)
 
-    # Парсим аргументы
-    task = None
-    model = "openai/gpt-4o"
-    headless = False
+	task = None
+	model = "openai/gpt-4o"
+	headless = False
 
-    i = 1
-    while i < len(sys.argv):
-        arg = sys.argv[i]
+	i = 1
+	while i < len(sys.argv):
+		arg = sys.argv[i]
+		if arg == "--model" and i + 1 < len(sys.argv):
+			model = sys.argv[i + 1]
+			i += 2
+		elif arg == "--headless":
+			headless = True
+			i += 1
+		elif arg.startswith("--"):
+			print(f"Неизвестная опция: {arg}")
+			sys.exit(1)
+		else:
+			task = arg
+			i += 1
 
-        if arg == "--model" and i + 1 < len(sys.argv):
-            model = sys.argv[i + 1]
-            i += 2
-        elif arg == "--headless":
-            headless = True
-            i += 1
-        elif arg.startswith("--"):
-            print(f"Неизвестная опция: {arg}")
-            sys.exit(1)
-        else:
-            # Всё что не флаг — это задача
-            task = arg
-            i += 1
+	if not task:
+		print("Не указана задача")
+		sys.exit(1)
 
-    if not task:
-        print("Не указана задача")
-        sys.exit(1)
-
-    # Запускаем
-    asyncio.run(run_task(task, model=model, headless=headless))
+	asyncio.run(run_task(task, model=model, headless=headless))
 
 
 if __name__ == "__main__":
-    main()
+	main()
