@@ -30,16 +30,36 @@ class SecurityLayer:
 
         # Опасные ключевые слова (только финальные действия оплаты)
         self.dangerous_keywords = {
-            # Только финальное подтверждение оплаты
+            # Финальное подтверждение оплаты
             "confirm payment",
             "complete purchase",
             "pay now",
             "submit payment",
             "place order and pay",
+            "pay with card",
+            "pay with",
+            # Checkout и оформление заказа (блокируем более агрессивно)
+            "checkout",
+            "place order",
+            "proceed to checkout",
+            "go to checkout",
+            "continue to checkout",
+            "оформить заказ",
+            "оформить",
+            "перейти к оформлению",
+            "перейти к оплате",
+            # Кнопки оплаты
+            "оплатить",
+            "оплату",
+            "кнопка оплатить",
+            "payment button",
+            "pay button",
             # Банковские данные
             "enter card number",
             "enter cvv",
             "enter expiry",
+            "card number",
+            "card details",
             # Новые вкладки
             "open in new tab",
             "open in new window",
@@ -52,17 +72,30 @@ class SecurityLayer:
         # Безопасные контексты — эти действия разрешены
         self.safe_contexts = {
             "select", "choose", "option", "size", "sauce", "topping",
-            "add to cart", "add item", "add to basket",
-            "checkout", "place order", "continue shopping", "view cart"
+            "add to cart", "add item", "add to basket", "add to",
+            "continue shopping", "view cart", "view basket",
+            "select size", "select option", "choose size"
         }
 
-        # Опасные паттерны URL (блокируем только финальный шаг оплаты)
+        # Опасные паттерны URL (блокируем checkout и оплату)
         self.dangerous_url_patterns = {
             "/payment/confirm",
             "/payment/submit",
             "/order/complete",
             "/checkout/success",
             "/pay",
+            "/checkout",
+            "/cart/checkout",
+            "/order/checkout",
+            "/ordering",
+            "/оформить",
+            "/оплата",
+            "/basket/checkout",
+            # Паттерны для российских сервисов доставки
+            "checkout",
+            "ordering",
+            "payment",
+            "pay",
         }
 
     async def __call__(
@@ -122,6 +155,23 @@ class SecurityLayer:
             # Отладочный вывод
             if self.debug:
                 print(f"[Security Layer Step {self.step_count}] {action_text[:100]}...")
+
+            # Дополнительная проверка: клик по элементу с текстом checkout/оплатить
+            if "click" in action_text:
+                # Проверяем есть ли в действии текст кнопки
+                for dangerous in ["оплатить", "checkout", "place order", "оформить заказ", "pay now"]:
+                    if dangerous in action_text:
+                        self.blocked_count += 1
+                        print("\n" + "=" * 60)
+                        print("🔒 SECURITY LAYER: Попытка нажать кнопку оплаты/оформления")
+                        print("=" * 60)
+                        print(f"Действие: {action}")
+                        print(f"URL: {browser_state.url}")
+                        print(f"Обнаружен текст: {dangerous}")
+                        print("=" * 60)
+                        raise SecurityLayerBlockedAction(
+                            f"Клик по кнопке '{dangerous}' заблокирован: {action}"
+                        )
 
             # Проверяем на опасные ключевые слова
             if self._is_dangerous(action_text):
