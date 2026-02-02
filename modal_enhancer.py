@@ -155,71 +155,75 @@ class ModalEnhancer:
 
         Это помогает понять, какие элементы доступны для клика и какие индексы они имеют.
         """
-        if not browser_state.dom_state or not browser_state.dom_state._root:
+        if not browser_state.dom_state or not browser_state.dom_state.selector_map:
+            print(f"\n  [ModalEnhancer] Шаг {step}: Интерактивные элементы (с индексами):")
+            print("  ⚠️ Интерактивные элементы не найдены!")
             return
 
-        print(f"\n  [ModalEnhancer] Шаг {step}: Интерактивные элементы (с индексами):")
+        print(f"\n  [ModalEnhancer] Шаг {step}: Интерактивные элементы (с индексов: {len(browser_state.dom_state.selector_map)}):")
 
+        # selector_map содержит dict[int, EnhancedDOMTreeNode]
+        # где int - это индекс элемента для клика
         elements_found = []
-        max_elements = 20  # Ограничиваем вывод
+        max_elements = 30  # Ограничиваем вывод
 
-        def collect_interactive(node: SimplifiedNode, depth: int = 0) -> None:
+        for index, enhanced_node in browser_state.dom_state.selector_map.items():
             if len(elements_found) >= max_elements:
-                return
+                break
 
-            if not node or not node.original_node:
-                return
+            # Получаем текст элемента из различных источников
+            text = ""
+            try:
+                # Пытаемся получить текст из ax_node
+                if enhanced_node.ax_node and enhanced_node.ax_node.name:
+                    text = enhanced_node.ax_node.name[:50]
+                # Или из node_value
+                elif enhanced_node.node_value:
+                    text = enhanced_node.node_value[:50]
+            except Exception:
+                pass
 
-            original = node.original_node
+            # Получаем основные атрибуты
+            tag = enhanced_node.tag_name if hasattr(enhanced_node, 'tag_name') else ''
+            attrs = enhanced_node.attributes if hasattr(enhanced_node, 'attributes') else {}
 
-            # Проверяем, есть ли у элемента индекс (highlight_index)
-            if hasattr(node, 'highlight_index') and node.highlight_index is not None:
-                # Получаем текст элемента
-                text = ""
-                if hasattr(node, 'get_all_children_text'):
-                    text = node.get_all_children_text()[:30]
+            # Определяем тип элемента
+            element_type = tag
+            role = attrs.get('role', '') if attrs else ''
+            if role:
+                element_type = f'{tag}[role="{role}"]'
 
-                # Получаем основные атрибуты
-                tag = original.tag_name if hasattr(original, 'tag_name') else ''
-                attrs = original.attributes if hasattr(original, 'attributes') else {}
+            # Проверяем на классы, связанные с модальными окнами
+            class_attr = attrs.get('class', '') if attrs else ''
+            is_modal_related = any(p in class_attr.lower() for p in self.modal_class_patterns)
 
-                # Определяем тип элемента
-                element_type = tag
-                role = attrs.get('role', '') if attrs else ''
-                if role:
-                    element_type = f'{tag}[role="{role}"]'
+            # Проверяем aria-label (важно для кнопок)
+            aria_label = attrs.get('aria-label', '') if attrs else ''
 
-                # Проверяем на классы, связанные с модальными окнами
-                class_attr = attrs.get('class', '') if attrs else ''
-                is_modal_related = any(p in class_attr.lower() for p in self.modal_class_patterns)
-
-                elements_found.append({
-                    'index': node.highlight_index,
-                    'type': element_type,
-                    'text': text,
-                    'is_modal': is_modal_related,
-                    'class': class_attr[:30] if class_attr else '',
-                })
-
-            # Рекурсивно обходим детей
-            for child in node.children:
-                collect_interactive(child, depth + 1)
-
-        collect_interactive(browser_state.dom_state._root)
+            elements_found.append({
+                'index': index,
+                'type': element_type,
+                'text': text,
+                'aria_label': aria_label[:30] if aria_label else '',
+                'is_modal': is_modal_related,
+                'class': class_attr[:30] if class_attr else '',
+            })
 
         if elements_found:
             # Сортируем по индексу
             elements_found.sort(key=lambda x: x['index'])
 
             print("  Доступные для клика элементы:")
-            for elem in elements_found[:15]:  # Первые 15 элементов
+            for elem in elements_found[:20]:  # Первые 20 элементов
                 modal_mark = " 🎯" if elem['is_modal'] else ""
-                print(f"    [{elem['index']}] {elem['type']}: '{elem['text']}'{modal_mark}")
-                if elem['class']:
+                text_display = f"'{elem['text']}'" if elem['text'] else ''
+                aria_display = f" aria-label:'{elem['aria_label']}'" if elem['aria_label'] else ''
+                print(f"    [{elem['index']}] {elem['type']}: {text_display}{aria_display}{modal_mark}")
+                if elem['class'] and elem['is_modal']:
                     print(f"         class: {elem['class']}")
 
-            if len(elements_found) >= max_elements:
-                print(f"    ... (показано первые {max_elements} элементов)")
+            if len(browser_state.dom_state.selector_map) > max_elements:
+                print(f"    ... (показано первые {max_elements} из {len(browser_state.dom_state.selector_map)} элементов)")
         else:
             print("  ⚠️ Интерактивные элементы не найдены!")
 
